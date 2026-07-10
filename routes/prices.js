@@ -1,18 +1,18 @@
-// routes/prices.js — live prices from CoinGecko's free public API.
+// routes/prices.js — live prices from Binance's free public API.
 
 const express = require('express');
 const fetch = require('node-fetch');
 const router = express.Router();
 
-const COINGECKO_IDS = {
-  BTC: 'bitcoin',
-  ETH: 'ethereum',
-  SOL: 'solana',
-  USDC: 'usd-coin',
-  XRP: 'ripple',
-  ADA: 'cardano',
-  DOGE: 'dogecoin',
-  LINK: 'chainlink',
+const BINANCE_SYMBOLS = {
+  BTC: 'BTCUSDT',
+  ETH: 'ETHUSDT',
+  SOL: 'SOLUSDT',
+  USDC: 'USDCUSDT',
+  XRP: 'XRPUSDT',
+  ADA: 'ADAUSDT',
+  DOGE: 'DOGEUSDT',
+  LINK: 'LINKUSDT',
 };
 
 let cache = { data: null, fetchedAt: 0 };
@@ -23,17 +23,23 @@ router.get('/', async (req, res) => {
   if (cache.data && now - cache.fetchedAt < CACHE_MS) {
     return res.json(cache.data);
   }
+
   try {
-    const ids = Object.values(COINGECKO_IDS).join(',');
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
-    const r = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; FathomApp/1.0)' } });
-    if (!r.ok) throw new Error(`CoinGecko responded ${r.status}`);
+    const symbols = JSON.stringify(Object.values(BINANCE_SYMBOLS));
+    const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Binance responded ${r.status}`);
     const raw = await r.json();
-    const out = Object.entries(COINGECKO_IDS).map(([sym, id]) => ({
-      sym,
-      price: raw[id]?.usd ?? null,
-      chg: raw[id]?.usd_24h_change ?? null,
-    }));
+
+    const out = Object.entries(BINANCE_SYMBOLS).map(([sym, pair]) => {
+      const row = raw.find(x => x.symbol === pair);
+      return {
+        sym,
+        price: row ? parseFloat(row.lastPrice) : null,
+        chg: row ? parseFloat(row.priceChangePercent) : null,
+      };
+    });
+
     cache = { data: out, fetchedAt: now };
     res.json(out);
   } catch (err) {
