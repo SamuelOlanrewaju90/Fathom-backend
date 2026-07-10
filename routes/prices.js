@@ -26,7 +26,7 @@ router.get('/', async (req, res) => {
   try {
     const ids = Object.values(COINGECKO_IDS).join(',');
     const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
-    const r = await fetch(url);
+    const r = await fetch(url, { headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; FathomApp/1.0)' } });
     if (!r.ok) throw new Error(`CoinGecko responded ${r.status}`);
     const raw = await r.json();
     const out = Object.entries(COINGECKO_IDS).map(([sym, id]) => ({
@@ -37,6 +37,7 @@ router.get('/', async (req, res) => {
     cache = { data: out, fetchedAt: now };
     res.json(out);
   } catch (err) {
+    console.error('Price fetch failed:', err.message);
     if (cache.data) return res.json(cache.data);
     res.status(502).json({ error: 'Could not reach the price feed. Try again shortly.' });
   }
