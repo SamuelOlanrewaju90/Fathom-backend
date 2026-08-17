@@ -1,5 +1,3 @@
-// routes/auth.js — account creation, login, and two-factor authentication.
-
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -7,13 +5,12 @@ const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
 const rateLimit = require('express-rate-limit');
 
-const db = require('../db');
+const { pool } = require('../db');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Stricter limiter just for login/register — slows down password-guessing.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -25,34 +22,37 @@ function signToken(userId){
 }
 
 function isValidEmail(email){
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '');
 }
 
-// ---------- register ----------
 router.post('/register', authLimiter, async (req, res) => {
   const { email, password } = req.body;
-
   if (!isValidEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' });
   if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-  if (existing) return res.status(409).json({ error: 'An account with that email already exists.' });
+  const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  if (existing.rows.length) return res.status(409).json({ error: 'An account with that email already exists.' });
 
   const hash = await bcrypt.hash(password, 12);
-  const result = db.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)').run(email, hash);
+  const inserted = await pool.query(
+    'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
+    [email, hash]
+  );
+  const userId = inserted.rows[0].id;
 
-  // seed a starting demo balance so the dashboard has something to show
-  db.prepare('INSERT INTO holdings (user_id, symbol, quantity) VALUES (?, ?, ?)').run(result.lastInsertRowid, 'USD_CASH', 10000);
+  await pool.query(
+    'INSERT INTO holdings (user_id, symbol, quantity) VALUES ($1, $2, $3)',
+    [userId, 'USD_CASH', 10000]
+  );
 
-  const token = signToken(result.lastInsertRowid);
+  const token = signToken(userId);
   res.status(201).json({ token, email });
 });
 
-// ---------- login ----------
 router.post('/login', authLimiter, async (req, res) => {
   const { email, password, totpToken } = req.body;
-
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+  const user = result.rows[0];
   if (!user) return res.status(401).json({ error: 'Incorrect email or password.' });
 
   const valid = await bcrypt.compare(password, user.password_hash);
@@ -69,72 +69,57 @@ router.post('/login', authLimiter, async (req, res) => {
   res.json({ token, email: user.email });
 });
 
-// ---------- 2FA: start setup (returns QR code) ----------
 router.post('/2fa/setup', requireAuth, async (req, res) => {
   const secret = speakeasy.generateSecret({ name: `Fathom (${req.userId})` });
   const qrDataUrl = await qrcode.toDataURL(secret.otpauth_url);
-
-  // store temporarily, unconfirmed, until the user verifies a code
-  db.prepare('UPDATE users SET totp_secret_encrypted = ? WHERE id = ?')
-    .run(encrypt(secret.base32), req.userId);
-
+  await pool.query('UPDATE users SET totp_secret_encrypted = $1 WHERE id = $2', [encrypt(secret.base32), req.userId]);
   res.json({ qrCode: qrDataUrl, manualEntryKey: secret.base32 });
 });
 
-// ---------- 2FA: confirm setup with a code from the authenticator app ----------
-router.post('/2fa/verify', requireAuth, (req, res) => {
+router.post('/2fa/verify', requireAuth, async (req, res) => {
   const { token } = req.body;
-  const user = db.prepare('SELECT totp_secret_encrypted FROM users WHERE id = ?').get(req.userId);
+  const result = await pool.query('SELECT totp_secret_encrypted FROM users WHERE id = $1', [req.userId]);
+  const user = result.rows[0];
   if (!user || !user.totp_secret_encrypted) return res.status(400).json({ error: 'Start 2FA setup first.' });
 
   const secret = decrypt(user.totp_secret_encrypted);
   const ok = speakeasy.totp.verify({ secret, encoding: 'base32', token, window: 1 });
-  if (!ok) return res.status(400).json({ error: 'That code didn\'t match. Try again.' });
+  if (!ok) return res.status(400).json({ error: "That code didn't match. Try again." });
 
-  db.prepare('UPDATE users SET totp_enabled = 1 WHERE id = ?').run(req.userId);
+  await pool.query('UPDATE users SET totp_enabled = TRUE WHERE id = $1', [req.userId]);
   res.json({ enabled: true });
 });
 
-// ---------- 2FA: turn off ----------
-router.post('/2fa/disable', requireAuth, (req, res) => {
-  db.prepare('UPDATE users SET totp_enabled = 0, totp_secret_encrypted = NULL WHERE id = ?').run(req.userId);
+router.post('/2fa/disable', requireAuth, async (req, res) => {
+  await pool.query('UPDATE users SET totp_enabled = FALSE, totp_secret_encrypted = NULL WHERE id = $1', [req.userId]);
   res.json({ enabled: false });
 });
 
-// ---------- who am I ----------
-router.get('/me', requireAuth, (req, res) => {
-  const user = db.prepare('SELECT id, email, totp_enabled, created_at FROM users WHERE id = ?').get(req.userId);
-  res.json(user);
+router.get('/me', requireAuth, async (req, res) => {
+  const result = await pool.query('SELECT id, email, totp_enabled, created_at FROM users WHERE id = $1', [req.userId]);
+  res.json(result.rows[0]);
 });
 
-// ---------- change password ----------
 router.patch('/password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters.' });
 
-  const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.userId);
-  const valid = await bcrypt.compare(currentPassword || '', user.password_hash);
+  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.userId]);
+  const valid = await bcrypt.compare(currentPassword || '', result.rows[0].password_hash);
   if (!valid) return res.status(401).json({ error: 'Current password is incorrect.' });
 
   const newHash = await bcrypt.hash(newPassword, 12);
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, req.userId);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, req.userId]);
   res.json({ ok: true });
 });
 
-// ---------- delete account ----------
 router.delete('/me', requireAuth, async (req, res) => {
   const { password } = req.body;
-  const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.userId);
-  const valid = await bcrypt.compare(password || '', user.password_hash);
+  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.userId]);
+  const valid = await bcrypt.compare(password || '', result.rows[0].password_hash);
   if (!valid) return res.status(401).json({ error: 'Password is incorrect.' });
 
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM activity WHERE user_id = ?').run(req.userId);
-    db.prepare('DELETE FROM holdings WHERE user_id = ?').run(req.userId);
-    db.prepare('DELETE FROM users WHERE id = ?').run(req.userId);
-  });
-  tx();
-
+  await pool.query('DELETE FROM users WHERE id = $1', [req.userId]);
   res.json({ ok: true });
 });
 
